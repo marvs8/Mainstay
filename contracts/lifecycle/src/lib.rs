@@ -1357,6 +1357,7 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .extend_ttl(&score_key(asset_id), 518400, 518400);
+        score_history_push(&env, asset_id, ScoreEntry { timestamp: now, score: 0 }, config.max_history);
         env.storage()
             .persistent()
             .set(&last_update_key(asset_id), &now);
@@ -3807,6 +3808,31 @@ mod tests {
         // Admin resets the score
         client.reset_score(&admin, &asset_id);
         assert_eq!(client.get_collateral_score(&asset_id), 0);
+    }
+
+    #[test]
+    fn test_reset_score_appends_zero_to_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "Major overhaul"),
+            &engineer,
+        );
+        let history_before = client.get_score_history(&asset_id);
+        assert!(history_before.last().unwrap().score > 0);
+
+        client.reset_score(&admin, &asset_id);
+
+        let history_after = client.get_score_history(&asset_id);
+        assert!(history_after.len() > history_before.len());
+        assert_eq!(history_after.last().unwrap().score, 0);
     }
 
     #[test]
