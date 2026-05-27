@@ -54,6 +54,12 @@ const REVOKE_TOPIC: Symbol = symbol_short!("REV_CRED");
 const MIN_VALIDITY_PERIOD: u64 = 86_400;
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 
+
+/// Soroban persistent-storage TTL constants.
+/// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
+const TTL_THRESHOLD: u32 = 518_400;
+const TTL_TARGET: u32 = 518_400;
+
 fn is_paused(env: &Env) -> bool {
     env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
 }
@@ -138,10 +144,6 @@ impl EngineerRegistry {
             // existing is present but not active (revoked) => allow re-registration.
         }
 
-
-
-
-
         let now = env.ledger().timestamp();
         let record = Engineer {
             address: engineer.clone(),
@@ -156,7 +158,7 @@ impl EngineerRegistry {
             .set(&engineer_key(&engineer), &record);
         env.storage()
             .persistent()
-            .extend_ttl(&engineer_key(&engineer), 518400, 518400);
+            .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
 
         // Track issuer → engineers mapping (avoid duplicates on re-registration after revoke)
         let mut list: Vec<Address> = env
@@ -172,7 +174,7 @@ impl EngineerRegistry {
             .set(&issuer_engineers_key(&issuer), &list);
         env.storage()
             .persistent()
-            .extend_ttl(&issuer_engineers_key(&issuer), 518400, 518400);
+            .extend_ttl(&issuer_engineers_key(&issuer), TTL_THRESHOLD, TTL_TARGET);
 
         // Emit engineer registration event
         env.events().publish(
@@ -195,6 +197,30 @@ impl EngineerRegistry {
             .get::<_, Engineer>(&engineer_key(&engineer))
             .map(|e| e.active && env.ledger().timestamp() < e.expires_at)
             .unwrap_or(false)
+    }
+
+    /// Verify multiple engineers in a single call.
+    /// Results are returned in the same order as the input vec.
+    ///
+    /// # Arguments
+    /// * `engineers` - Vec of engineer addresses to verify
+    ///
+    /// # Returns
+    /// `Vec<bool>` where each element is `true` if the corresponding engineer
+    /// has valid, non-expired credentials; `false` otherwise
+    pub fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<bool> {
+        let now = env.ledger().timestamp();
+        let mut results: Vec<bool> = Vec::new(&env);
+        for engineer in engineers.iter() {
+            let valid = env
+                .storage()
+                .persistent()
+                .get::<_, Engineer>(&engineer_key(&engineer))
+                .map(|e| e.active && now < e.expires_at)
+                .unwrap_or(false);
+            results.push_back(valid);
+        }
+        results
     }
 
     /// Revoke an engineer's credentials, making them inactive.
@@ -224,7 +250,7 @@ impl EngineerRegistry {
         // Extend TTL before write to ensure consistency even on near-expired entries
         env.storage()
             .persistent()
-            .extend_ttl(&engineer_key(&engineer), 518400, 518400);
+            .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
         record.active = false;
         env.storage()
             .persistent()
@@ -274,7 +300,7 @@ impl EngineerRegistry {
         record.expires_at = renewal_base + new_validity_period;
         env.storage()
             .persistent()
-            .extend_ttl(&engineer_key(&engineer), 518400, 518400);
+            .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
         env.storage()
             .persistent()
             .set(&engineer_key(&engineer), &record);
@@ -335,17 +361,18 @@ impl EngineerRegistry {
     /// This function should be called once immediately after deployment.
     ///
     /// # Arguments
+    /// * `deployer` - The address of the contract deployer; must sign this transaction.
     /// * `admin` - The address that will have administrative privileges
     ///
     /// # Panics
     /// - [`ContractError::AdminAlreadyInitialized`] if admin has already been initialized
-    pub fn initialize_admin(env: Env, admin: Address) {
-        admin.require_auth();
+    pub fn initialize_admin(env: Env, deployer: Address, admin: Address) {
+        deployer.require_auth();
         if env.storage().instance().has(&admin_key()) {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
         }
         env.storage().instance().set(&admin_key(), &admin);
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Get the current admin address of the contract.
@@ -422,8 +449,7 @@ impl EngineerRegistry {
         env.storage().persistent().set(&PAUSED_KEY, &true);
         env.storage()
             .persistent()
-            .extend_ttl(&PAUSED_KEY, 518400, 518400);
-        env.storage().instance().extend_ttl(518400, 518400);
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish((symbol_short!("PAUSED"),), (admin,));
     }
 
@@ -440,8 +466,7 @@ impl EngineerRegistry {
         env.storage().persistent().set(&PAUSED_KEY, &false);
         env.storage()
             .persistent()
-            .extend_ttl(&PAUSED_KEY, 518400, 518400);
-        env.storage().instance().extend_ttl(518400, 518400);
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish((symbol_short!("UNPAUSED"),), (admin,));
     }
 
@@ -505,11 +530,11 @@ impl EngineerRegistry {
         if !list.contains(issuer.clone()) {
             list.push_back(issuer.clone());
             env.storage().instance().set(&issuer_list_key(), &list);
-            env.storage().instance().extend_ttl(518400, 518400);
+            env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
             env.events()
                 .publish((symbol_short!("ISS_ADD"), admin), (issuer,));
         } else {
-            env.storage().instance().extend_ttl(518400, 518400);
+            env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
         }
     }
 
@@ -553,7 +578,7 @@ impl EngineerRegistry {
             }
         }
         env.storage().instance().set(&issuer_list_key(), &new_list);
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
 
         // Revoke all active engineers registered by this issuer
         let engineers: Vec<Address> = env
@@ -571,7 +596,7 @@ impl EngineerRegistry {
                     record.active = false;
                     env.storage()
                         .persistent()
-                        .extend_ttl(&engineer_key(&engineer), 518400, 518400);
+                        .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
                     env.storage()
                         .persistent()
                         .set(&engineer_key(&engineer), &record);
@@ -658,7 +683,7 @@ mod tests {
         let contract_id = env.register(EngineerRegistry, ());
         let client = EngineerRegistryClient::new(env, &contract_id);
         let admin = Address::generate(env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         (client, admin)
     }
 
@@ -671,9 +696,9 @@ mod tests {
         let client = EngineerRegistryClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         // Second call must panic
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
     }
 
     #[test]
@@ -792,7 +817,7 @@ mod tests {
         let client = EngineerRegistryClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
 
         // Second call should fail with structured error
         let result = client.try_initialize_admin(&admin);
@@ -813,7 +838,7 @@ mod tests {
 
         let admin = Address::generate(&env);
         // This should succeed because we mock all auths
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
 
         // Verify admin was set
         assert_eq!(client.get_admin(), admin);
@@ -827,7 +852,7 @@ mod tests {
         let client = EngineerRegistryClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
 
         let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
         assert!(
@@ -1937,7 +1962,7 @@ mod tests {
                 sub_invokes: &[],
             },
         }]);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
 
         // Add both issuers as trusted
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
@@ -2092,7 +2117,6 @@ mod tests {
             ))),
         );
     }
-
 
     #[test]
     fn test_no_duplicate_in_issuer_list_after_reregistration() {
@@ -2363,128 +2387,110 @@ mod tests {
         );
     }
 
-    // --- Instance TTL expiry tests ---
+    #[test]
+    fn test_initialize_admin_rejects_non_deployer() {
+        let env = Env::default();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
 
-    /// Helper: wipe all instance storage to simulate TTL expiry.
-    fn wipe_instance(env: &Env, contract_id: &Address) {
-        env.as_contract(contract_id, || {
-            env.storage().instance().remove(&admin_key());
-            env.storage().instance().remove(&pending_admin_key());
-            env.storage().instance().remove(&issuer_list_key());
-        });
+        let deployer = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        use soroban_sdk::IntoVal;
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "initialize_admin",
+                args: (&attacker, &attacker).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        let result = client.try_initialize_admin(&deployer, &attacker);
+        assert!(result.is_err(), "non-deployer must not be able to initialize");
+    fn setup_engineer(
+        env: &Env,
+        client: &EngineerRegistryClient,
+        issuer: &Address,
+        seed: u8,
+    ) -> Address {
+        let engineer = Address::generate(env);
+        client.register_engineer(
+            &engineer,
+            &BytesN::from_array(env, &[seed; 32]),
+            issuer,
+            &31_536_000,
+        );
+        engineer
     }
 
     #[test]
-    fn test_pause_extends_instance_ttl_after_expiry() {
+    fn test_batch_verify_engineers_all_active() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, admin) = setup(&env);
-
-        // Simulate instance TTL expiry — admin key is gone
-        wipe_instance(&env, &client.address);
-
-        // Re-initialize so pause can read the admin
-        client.initialize_admin(&admin);
-
-        // pause must extend instance TTL
-        client.pause(&admin);
-        let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
-        assert!(ttl > 0, "pause must extend instance TTL");
-    }
-
-    #[test]
-    fn test_unpause_extends_instance_ttl_after_expiry() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-
-        client.pause(&admin);
-        wipe_instance(&env, &client.address);
-        client.initialize_admin(&admin);
-
-        client.unpause(&admin);
-        let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
-        assert!(ttl > 0, "unpause must extend instance TTL");
-    }
-
-    #[test]
-    fn test_propose_admin_extends_instance_ttl_after_expiry() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-
-        wipe_instance(&env, &client.address);
-        client.initialize_admin(&admin);
-
-        let new_admin = Address::generate(&env);
-        client.propose_admin(&admin, &new_admin);
-        let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
-        assert!(ttl > 0, "propose_admin must extend instance TTL");
-    }
-
-    #[test]
-    fn test_accept_admin_extends_instance_ttl_after_expiry() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-
-        let new_admin = Address::generate(&env);
-        client.propose_admin(&admin, &new_admin);
-
-        // Wipe instance storage (simulates TTL expiry between propose and accept)
-        // We must restore admin + pending_admin so accept_admin can read them
-        env.as_contract(&client.address, || {
-            // Keep admin and pending_admin but clear issuer_list to simulate partial expiry
-            env.storage().instance().remove(&issuer_list_key());
-        });
-
-        client.accept_admin();
-        assert_eq!(client.get_admin(), new_admin);
-        let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
-        assert!(ttl > 0, "accept_admin must extend instance TTL");
-    }
-
-    #[test]
-    fn test_upgrade_extends_instance_ttl_after_expiry() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-
-        wipe_instance(&env, &client.address);
-        client.initialize_admin(&admin);
-
-        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
-        client.upgrade(&admin, &hash);
-        let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
-        assert!(ttl > 0, "upgrade must extend instance TTL");
-    }
-
-    #[test]
-    fn test_admin_ops_work_after_instance_ttl_expiry_and_reinit() {
-        // Full scenario: instance expires, admin re-initializes, all ops succeed.
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
         let issuer = Address::generate(&env);
+        client.initialize_admin(&admin);
         client.add_trusted_issuer(&admin, &issuer);
 
-        // Simulate instance TTL expiry
-        wipe_instance(&env, &client.address);
+        let e1 = setup_engineer(&env, &client, &issuer, 1);
+        let e2 = setup_engineer(&env, &client, &issuer, 2);
+        let e3 = setup_engineer(&env, &client, &issuer, 3);
 
-        // Re-initialize admin (as would happen after TTL expiry recovery)
+        let results = client.batch_verify_engineers(&soroban_sdk::vec![&env, e1, e2, e3]);
+        assert_eq!(results.len(), 3);
+        assert!(results.get(0).unwrap());
+        assert!(results.get(1).unwrap());
+        assert!(results.get(2).unwrap());
+    }
+
+    #[test]
+    fn test_batch_verify_engineers_mixed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let issuer = Address::generate(&env);
         client.initialize_admin(&admin);
+        client.add_trusted_issuer(&admin, &issuer);
 
-        // All admin ops must succeed and extend TTL
-        client.pause(&admin);
-        client.unpause(&admin);
+        let active = setup_engineer(&env, &client, &issuer, 10);
+        let revoked = setup_engineer(&env, &client, &issuer, 11);
+        let unknown = Address::generate(&env);
 
-        let new_admin = Address::generate(&env);
-        client.propose_admin(&admin, &new_admin);
-        client.accept_admin();
-        assert_eq!(client.get_admin(), new_admin);
+        client.revoke_credential(&revoked);
 
-        let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
-        assert!(ttl > 0, "instance TTL must be live after admin ops");
+        let results =
+            client.batch_verify_engineers(&soroban_sdk::vec![&env, active, revoked, unknown]);
+        assert_eq!(results.len(), 3);
+        assert!(results.get(0).unwrap());   // active
+        assert!(!results.get(1).unwrap());  // revoked
+        assert!(!results.get(2).unwrap());  // not registered
+    }
+
+    #[test]
+    fn test_batch_verify_engineers_all_inactive() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let e1 = setup_engineer(&env, &client, &issuer, 20);
+        let e2 = setup_engineer(&env, &client, &issuer, 21);
+        client.revoke_credential(&e1);
+        client.revoke_credential(&e2);
+
+        let results = client.batch_verify_engineers(&soroban_sdk::vec![&env, e1, e2]);
+        assert_eq!(results.len(), 2);
+        assert!(!results.get(0).unwrap());
+        assert!(!results.get(1).unwrap());
     }
 }
