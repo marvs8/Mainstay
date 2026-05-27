@@ -2405,6 +2405,8 @@ mod tests {
 
         let result = client.try_initialize_admin(&deployer, &attacker);
         assert!(result.is_err(), "non-deployer must not be able to initialize");
+    }
+
     fn setup_engineer(
         env: &Env,
         client: &EngineerRegistryClient,

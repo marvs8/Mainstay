@@ -154,7 +154,6 @@ dependencies = [
 name = "asset-registry"
 version = "0.1.0"
 dependencies = [
- "lifecycle",
  "soroban-sdk",
 ]
 
