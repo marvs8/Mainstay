@@ -1296,11 +1296,10 @@ impl Lifecycle {
     /// * `engineer` - The address of the engineer to query
     ///
     /// # Returns
-    /// A Vec containing all asset IDs this engineer has worked on (capped at 100 entries)
-    ///
-    /// # Note
-    /// For engineers with large maintenance histories, use [`get_eng_history_page`] for pagination
-    /// to avoid high deserialization costs.
+    /// A Vec containing the **first 100** asset IDs this engineer has worked on.
+    /// If the engineer has more than 100 entries the result is silently truncated —
+    /// call [`get_engineer_maintenance_history_count`] to check the total, then use
+    /// [`get_eng_history_page`] with `offset`/`limit` to retrieve the full history.
     pub fn get_engineer_maintenance_history(env: Env, engineer: Address) -> Vec<u64> {
         let history: Vec<u64> = env
             .storage()
@@ -1318,6 +1317,25 @@ impl Lifecycle {
             result.push_back(history.get(i).unwrap());
         }
         result
+    }
+
+    /// Return the total number of asset IDs recorded for an engineer.
+    ///
+    /// Use this together with [`get_eng_history_page`] to paginate through histories
+    /// that exceed the 100-entry cap of [`get_engineer_maintenance_history`].
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer to query
+    ///
+    /// # Returns
+    /// Total number of entries in the engineer's maintenance history.
+    pub fn get_engineer_maintenance_history_count(env: Env, engineer: Address) -> u32 {
+        let history: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&engineer_history_key(&engineer))
+            .unwrap_or_else(|| Vec::new(&env));
+        history.len()
     }
 
     /// Get a paginated list of asset IDs that an engineer has worked on.
@@ -4581,6 +4599,30 @@ mod tests {
 
         let history = client.get_engineer_maintenance_history(&engineer);
         assert_eq!(history.len(), 100u32);
+    }
+
+    #[test]
+    fn test_get_engineer_maintenance_history_truncates_at_101() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        for _ in 0..101 {
+            let asset_id = register_asset(&env, &asset_registry_client);
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "maintenance"),
+                &engineer,
+            );
+        }
+
+        let history = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(history.len(), 100u32);
+        // confirm the full count is accessible via the count helper
+        assert_eq!(client.get_engineer_maintenance_history_count(&engineer), 101u32);
     }
 
     #[test]
