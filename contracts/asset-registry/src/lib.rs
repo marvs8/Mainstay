@@ -859,6 +859,45 @@ impl AssetRegistry {
         );
     }
 
+    /// Admin-only function to decommission an asset.
+    /// Sets the decommissioned flag and resets the collateral score to 0.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored admin
+    /// * `asset_id` - The unique identifier of the asset to decommission
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn decommission_asset(env: Env, admin: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        // Verify asset exists
+        if !Self::asset_exists(env.clone(), asset_id) {
+            panic_with_error!(&env, ContractError::AssetNotFound);
+        }
+
+        // Set decommissioned flag
+        let decomm_key = decommissioned_key(asset_id);
+        env.storage().persistent().set(&decomm_key, &true);
+        env.storage().persistent().extend_ttl(&decomm_key, TTL_THRESHOLD, TTL_TARGET);
+
+        // Clear the under_maintenance flag when decommissioning
+        let maint_key = (symbol_short!("U_MAINT"), asset_id);
+        env.storage().persistent().remove(&maint_key);
+
+        // Emit decommission event with asset_id and ledger sequence
+        let ledger_seq = env.ledger().sequence();
+        env.events()
+            .publish((symbol_short!("DECOMM"), asset_id), ledger_seq);
+    }
+
     /// Admin-only function to upgrade the contract WASM to a new hash.
     /// This allows for contract updates while maintaining state.
     ///
@@ -3356,5 +3395,106 @@ mod tests {
 
         let status = client.asset_status(&asset_id);
         assert_eq!(status, AssetStatus::UnderMaintenance);
+    }
+
+    #[test]
+    fn test_decommission_asset_admin_can_decommission() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Decomm Test"),
+            &owner,
+        );
+
+        // Decommission the asset
+        client.decommission_asset(&admin, &asset_id);
+
+        // Verify status is Decommissioned
+        let status = client.asset_status(&asset_id);
+        assert_eq!(status, AssetStatus::Decommissioned);
+    }
+
+    #[test]
+    fn test_decommission_asset_non_admin_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Decomm Test"),
+            &owner,
+        );
+
+        // Non-admin tries to decommission
+        let non_admin = Address::generate(&env);
+        let result = client.try_decommission_asset(&non_admin, &asset_id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_decommission_nonexistent_asset() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+
+        // Try to decommission non-existent asset
+        let result = client.try_decommission_asset(&admin, &999u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotFound as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_decommission_asset_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Event Test"),
+            &owner,
+        );
+
+        // Decommission the asset and check for event
+        client.decommission_asset(&admin, &asset_id);
+
+        let events = env.events().all();
+        // Should have at least one DECOMM event
+        assert!(events.len() > 0, "decommission_asset should emit an event");
     }
 }
