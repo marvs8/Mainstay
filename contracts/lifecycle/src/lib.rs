@@ -23,6 +23,7 @@ pub enum ContractError {
     SameRegistryAddress = 13,
     IndexOutOfBounds = 14,
     UnauthorizedOwner = 15,
+    EngineerNotAuthorized = 16,
 }
 
 #[contracttype]
@@ -128,6 +129,21 @@ fn last_update_key(asset_id: u64) -> (Symbol, u64) {
 
 fn engineer_history_key(engineer: &Address) -> (Symbol, Address) {
     (symbol_short!("ENG_HIST"), engineer.clone())
+}
+
+fn engineer_auth_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, Address) {
+    (symbol_short!("ENG_AUTH"), asset_id, engineer.clone())
+}
+
+fn require_engineer_authorized(env: &Env, asset_id: u64, engineer: &Address) {
+    let authorized: bool = env
+        .storage()
+        .persistent()
+        .get(&engineer_auth_key(asset_id, engineer))
+        .unwrap_or(false);
+    if !authorized {
+        panic_with_error!(env, ContractError::EngineerNotAuthorized);
+    }
 }
 
 fn engineer_history_add(env: &Env, engineer: &Address, asset_id: u64, max_history: u32) {
@@ -391,6 +407,47 @@ pub struct Lifecycle;
 
 #[contractimpl]
 impl Lifecycle {
+    /// Owner-approved per-asset authorization for maintenance submissions.
+    ///
+    /// A verified engineer must also be explicitly authorized by the current asset owner
+    /// before submitting maintenance for that asset.
+    pub fn authorize_engineer(env: Env, owner: Address, asset_id: u64, engineer: Address) {
+        ensure_not_paused(&env);
+        owner.require_auth();
+
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset =
+            asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.owner != owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        let key = engineer_auth_key(asset_id, &engineer);
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Revoke an engineer's owner-approved authorization for a specific asset.
+    pub fn revoke_engineer_auth(env: Env, owner: Address, asset_id: u64, engineer: Address) {
+        ensure_not_paused(&env);
+        owner.require_auth();
+
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset =
+            asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.owner != owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&engineer_auth_key(asset_id, &engineer));
+    }
+
     /// Initialize the lifecycle contract with registry addresses and configuration.
     /// Must be called once after deployment to bind dependent registries.
     ///
@@ -825,6 +882,7 @@ impl Lifecycle {
         if !registry.verify_engineer(&engineer) {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
+        require_engineer_authorized(&env, asset_id, &engineer);
 
         let timestamp = env.ledger().timestamp();
 
@@ -1015,6 +1073,7 @@ impl Lifecycle {
         if !engineer_registry_client.verify_engineer(&engineer) {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
+        require_engineer_authorized(&env, asset_id, &engineer);
 
         let mut history: Vec<MaintenanceRecord> = env
             .storage()
@@ -1851,6 +1910,18 @@ mod tests {
         )
     }
 
+    fn register_asset_for_owner(
+        env: &Env,
+        registry_client: &AssetRegistryClient,
+        owner: &Address,
+    ) -> u64 {
+        registry_client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(env, "Caterpillar 3516"),
+            owner,
+        )
+    }
+
     fn register_engineer(env: &Env, registry_client: &EngineerRegistryClient) -> Address {
         let engineer = Address::generate(env);
         let issuer = Address::generate(env);
@@ -1883,6 +1954,70 @@ mod tests {
 
         assert_eq!(client.get_collateral_score(&asset_id), 50);
         assert_eq!(client.get_maintenance_history(&asset_id).len(), 10);
+    }
+
+    #[test]
+    fn test_authorized_engineer_can_submit_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let owner = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry_client, &owner);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        client.authorize_engineer(&owner, &asset_id, &engineer);
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "authorized"),
+            &engineer,
+        );
+
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
+    }
+
+    #[test]
+    fn test_unauthorized_engineer_cannot_submit_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "unauthorized"),
+            &engineer,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::EngineerNotAuthorized as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_non_owner_cannot_authorize_engineer() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let owner = Address::generate(&env);
+        let rogue = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry_client, &owner);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let result = client.try_authorize_engineer(&rogue, &asset_id, &engineer);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedOwner as u32,
+            ))),
+        );
     }
 
     #[test]
