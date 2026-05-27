@@ -144,10 +144,6 @@ impl EngineerRegistry {
             // existing is present but not active (revoked) => allow re-registration.
         }
 
-
-
-
-
         let now = env.ledger().timestamp();
         let record = Engineer {
             address: engineer.clone(),
@@ -2116,7 +2112,6 @@ mod tests {
             ))),
         );
     }
-
 
     #[test]
     fn test_no_duplicate_in_issuer_list_after_reregistration() {

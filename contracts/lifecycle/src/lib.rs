@@ -1193,6 +1193,21 @@ impl Lifecycle {
         compute_decay(&env, asset_id)
     }
 
+    pub fn get_collateral_score_batch(env: Env, asset_ids: Vec<u64>) -> Vec<u32> {
+        // Ensure CONFIG is present (NotInitialized guard)
+        env.storage()
+            .persistent()
+            .get::<_, Config>(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        let asset_registry = get_asset_registry_addr(&env);
+        let mut results: Vec<u32> = Vec::new(&env);
+        for asset_id in asset_ids.iter() {
+            verify_asset_exists(&env, &asset_registry, &asset_id);
+            results.push_back(compute_decay(&env, asset_id));
+        }
+        results
+    }
+
     /// Returns the full score trend: one (timestamp, score) entry per maintenance event.
     /// Get the complete score history for an asset.
     /// Returns one (timestamp, score) entry per maintenance event.
@@ -3247,6 +3262,93 @@ mod tests {
         assert_eq!(
             stored_b_after, stored_b_before,
             "batch_is_collateral_eligible must not write decayed score to storage"
+        );
+    }
+
+    // --- get_collateral_score_batch tests ---
+
+    #[test]
+    fn test_get_collateral_score_batch_single_element() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        let asset_id = register_asset(&env, &asset_registry_client);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, ""),
+            &engineer,
+        );
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(asset_id);
+        let results = client.get_collateral_score_batch(&ids);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results.get(0).unwrap(),
+            client.get_collateral_score(&asset_id)
+        );
+    }
+
+    #[test]
+    fn test_get_collateral_score_batch_multi_element() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let asset_a = register_asset(&env, &asset_registry_client);
+        let asset_b = register_asset(&env, &asset_registry_client);
+
+        for _ in 0..10 {
+            client.submit_maintenance(
+                &asset_a,
+                &symbol_short!("ENGINE"),
+                &String::from_str(&env, ""),
+                &engineer,
+            );
+        }
+        client.submit_maintenance(
+            &asset_b,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, ""),
+            &engineer,
+        );
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(asset_a);
+        ids.push_back(asset_b);
+        let results = client.get_collateral_score_batch(&ids);
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results.get(0).unwrap(),
+            client.get_collateral_score(&asset_a)
+        );
+        assert_eq!(
+            results.get(1).unwrap(),
+            client.get_collateral_score(&asset_b)
+        );
+    }
+
+    #[test]
+    fn test_get_collateral_score_batch_unknown_asset_returns_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _) = setup(&env, 0);
+        let mut ids = Vec::new(&env);
+        ids.push_back(999u64);
+
+        let result = client.try_get_collateral_score_batch(&ids);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotFound as u32,
+            ))),
         );
     }
 
@@ -5925,6 +6027,9 @@ mod tests {
 
         // BUG: Currently, asset_id is STILL in engineer's history
         let history_after = lifecycle.get_eng_history_page(&engineer, &0, &10);
-        assert!(!history_after.contains(asset_id), "Asset ID should be removed from engineer history after purge");
+        assert!(
+            !history_after.contains(asset_id),
+            "Asset ID should be removed from engineer history after purge"
+        );
     }
 }
