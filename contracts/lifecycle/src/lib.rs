@@ -1373,7 +1373,7 @@ impl Lifecycle {
     /// # Returns
     /// A Vec containing the **first 100** asset IDs this engineer has worked on.
     /// If the engineer has more than 100 entries the result is silently truncated —
-    /// call [`get_engineer_maintenance_history_count`] to check the total, then use
+    /// call [`get_eng_maint_count`] to check the total, then use
     /// [`get_eng_history_page`] with `offset`/`limit` to retrieve the full history.
     pub fn get_engineer_maintenance_history(env: Env, engineer: Address) -> Vec<u64> {
         let history: Vec<u64> = env
@@ -1404,7 +1404,7 @@ impl Lifecycle {
     ///
     /// # Returns
     /// Total number of entries in the engineer's maintenance history.
-    pub fn get_engineer_maintenance_history_count(env: Env, engineer: Address) -> u32 {
+    pub fn get_eng_maint_count(env: Env, engineer: Address) -> u32 {
         let history: Vec<u64> = env
             .storage()
             .persistent()
@@ -4785,7 +4785,7 @@ mod tests {
         let history = client.get_engineer_maintenance_history(&engineer);
         assert_eq!(history.len(), 100u32);
         // confirm the full count is accessible via the count helper
-        assert_eq!(client.get_engineer_maintenance_history_count(&engineer), 101u32);
+        assert_eq!(client.get_eng_maint_count(&engineer), 101u32);
     }
 
     #[test]
