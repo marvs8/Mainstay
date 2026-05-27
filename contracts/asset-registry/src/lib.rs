@@ -6,7 +6,8 @@ use soroban_sdk::{
 };
 
 #[contracterror]
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
 pub enum ContractError {
     AssetNotFound = 1,
     /// Same owner attempted to register an asset with identical metadata.
