@@ -54,6 +54,12 @@ const REVOKE_TOPIC: Symbol = symbol_short!("REV_CRED");
 const MIN_VALIDITY_PERIOD: u64 = 86_400;
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 
+
+/// Soroban persistent-storage TTL constants.
+/// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
+const TTL_THRESHOLD: u32 = 518_400;
+const TTL_TARGET: u32 = 518_400;
+
 fn is_paused(env: &Env) -> bool {
     env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
 }
@@ -138,10 +144,6 @@ impl EngineerRegistry {
             // existing is present but not active (revoked) => allow re-registration.
         }
 
-
-
-
-
         let now = env.ledger().timestamp();
         let record = Engineer {
             address: engineer.clone(),
@@ -156,7 +158,7 @@ impl EngineerRegistry {
             .set(&engineer_key(&engineer), &record);
         env.storage()
             .persistent()
-            .extend_ttl(&engineer_key(&engineer), 518400, 518400);
+            .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
 
         // Track issuer → engineers mapping (avoid duplicates on re-registration after revoke)
         let mut list: Vec<Address> = env
@@ -172,7 +174,7 @@ impl EngineerRegistry {
             .set(&issuer_engineers_key(&issuer), &list);
         env.storage()
             .persistent()
-            .extend_ttl(&issuer_engineers_key(&issuer), 518400, 518400);
+            .extend_ttl(&issuer_engineers_key(&issuer), TTL_THRESHOLD, TTL_TARGET);
 
         // Emit engineer registration event
         env.events().publish(
@@ -195,6 +197,30 @@ impl EngineerRegistry {
             .get::<_, Engineer>(&engineer_key(&engineer))
             .map(|e| e.active && env.ledger().timestamp() < e.expires_at)
             .unwrap_or(false)
+    }
+
+    /// Verify multiple engineers in a single call.
+    /// Results are returned in the same order as the input vec.
+    ///
+    /// # Arguments
+    /// * `engineers` - Vec of engineer addresses to verify
+    ///
+    /// # Returns
+    /// `Vec<bool>` where each element is `true` if the corresponding engineer
+    /// has valid, non-expired credentials; `false` otherwise
+    pub fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<bool> {
+        let now = env.ledger().timestamp();
+        let mut results: Vec<bool> = Vec::new(&env);
+        for engineer in engineers.iter() {
+            let valid = env
+                .storage()
+                .persistent()
+                .get::<_, Engineer>(&engineer_key(&engineer))
+                .map(|e| e.active && now < e.expires_at)
+                .unwrap_or(false);
+            results.push_back(valid);
+        }
+        results
     }
 
     /// Revoke an engineer's credentials, making them inactive.
@@ -224,7 +250,7 @@ impl EngineerRegistry {
         // Extend TTL before write to ensure consistency even on near-expired entries
         env.storage()
             .persistent()
-            .extend_ttl(&engineer_key(&engineer), 518400, 518400);
+            .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
         record.active = false;
         env.storage()
             .persistent()
@@ -274,7 +300,7 @@ impl EngineerRegistry {
         record.expires_at = renewal_base + new_validity_period;
         env.storage()
             .persistent()
-            .extend_ttl(&engineer_key(&engineer), 518400, 518400);
+            .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
         env.storage()
             .persistent()
             .set(&engineer_key(&engineer), &record);
@@ -345,7 +371,7 @@ impl EngineerRegistry {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
         }
         env.storage().instance().set(&admin_key(), &admin);
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Get the current admin address of the contract.
@@ -420,7 +446,7 @@ impl EngineerRegistry {
         env.storage().persistent().set(&PAUSED_KEY, &true);
         env.storage()
             .persistent()
-            .extend_ttl(&PAUSED_KEY, 518400, 518400);
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish((symbol_short!("PAUSED"),), (admin,));
     }
 
@@ -437,7 +463,7 @@ impl EngineerRegistry {
         env.storage().persistent().set(&PAUSED_KEY, &false);
         env.storage()
             .persistent()
-            .extend_ttl(&PAUSED_KEY, 518400, 518400);
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish((symbol_short!("UNPAUSED"),), (admin,));
     }
 
@@ -501,11 +527,11 @@ impl EngineerRegistry {
         if !list.contains(issuer.clone()) {
             list.push_back(issuer.clone());
             env.storage().instance().set(&issuer_list_key(), &list);
-            env.storage().instance().extend_ttl(518400, 518400);
+            env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
             env.events()
                 .publish((symbol_short!("ISS_ADD"), admin), (issuer,));
         } else {
-            env.storage().instance().extend_ttl(518400, 518400);
+            env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
         }
     }
 
@@ -549,7 +575,7 @@ impl EngineerRegistry {
             }
         }
         env.storage().instance().set(&issuer_list_key(), &new_list);
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
 
         // Revoke all active engineers registered by this issuer
         let engineers: Vec<Address> = env
@@ -567,7 +593,7 @@ impl EngineerRegistry {
                     record.active = false;
                     env.storage()
                         .persistent()
-                        .extend_ttl(&engineer_key(&engineer), 518400, 518400);
+                        .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
                     env.storage()
                         .persistent()
                         .set(&engineer_key(&engineer), &record);
@@ -2087,7 +2113,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_no_duplicate_in_issuer_list_after_reregistration() {
         let env = Env::default();
@@ -2355,5 +2380,90 @@ mod tests {
                 ContractError::Paused as u32
             )))
         );
+    }
+
+    fn setup_engineer(
+        env: &Env,
+        client: &EngineerRegistryClient,
+        issuer: &Address,
+        seed: u8,
+    ) -> Address {
+        let engineer = Address::generate(env);
+        client.register_engineer(
+            &engineer,
+            &BytesN::from_array(env, &[seed; 32]),
+            issuer,
+            &31_536_000,
+        );
+        engineer
+    }
+
+    #[test]
+    fn test_batch_verify_engineers_all_active() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let e1 = setup_engineer(&env, &client, &issuer, 1);
+        let e2 = setup_engineer(&env, &client, &issuer, 2);
+        let e3 = setup_engineer(&env, &client, &issuer, 3);
+
+        let results = client.batch_verify_engineers(&soroban_sdk::vec![&env, e1, e2, e3]);
+        assert_eq!(results.len(), 3);
+        assert!(results.get(0).unwrap());
+        assert!(results.get(1).unwrap());
+        assert!(results.get(2).unwrap());
+    }
+
+    #[test]
+    fn test_batch_verify_engineers_mixed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let active = setup_engineer(&env, &client, &issuer, 10);
+        let revoked = setup_engineer(&env, &client, &issuer, 11);
+        let unknown = Address::generate(&env);
+
+        client.revoke_credential(&revoked);
+
+        let results =
+            client.batch_verify_engineers(&soroban_sdk::vec![&env, active, revoked, unknown]);
+        assert_eq!(results.len(), 3);
+        assert!(results.get(0).unwrap());   // active
+        assert!(!results.get(1).unwrap());  // revoked
+        assert!(!results.get(2).unwrap());  // not registered
+    }
+
+    #[test]
+    fn test_batch_verify_engineers_all_inactive() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let e1 = setup_engineer(&env, &client, &issuer, 20);
+        let e2 = setup_engineer(&env, &client, &issuer, 21);
+        client.revoke_credential(&e1);
+        client.revoke_credential(&e2);
+
+        let results = client.batch_verify_engineers(&soroban_sdk::vec![&env, e1, e2]);
+        assert_eq!(results.len(), 2);
+        assert!(!results.get(0).unwrap());
+        assert!(!results.get(1).unwrap());
     }
 }

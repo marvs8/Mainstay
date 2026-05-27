@@ -47,6 +47,11 @@ const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const ASSET_TYPE_PREFIX: Symbol = symbol_short!("AST_TYPE");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
+
+/// Soroban persistent-storage TTL constants.
+/// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
+const TTL_THRESHOLD: u32 = 518_400;
+const TTL_TARGET: u32 = 518_400;
 pub const DEREG_TOPIC: Symbol = symbol_short!("DEREG");
 pub const ADD_TYPE_TOPIC: Symbol = symbol_short!("ADD_TYPE");
 pub const RM_TYPE_TOPIC: Symbol = symbol_short!("RM_TYPE");
@@ -89,6 +94,40 @@ fn type_count_dec(env: &Env, asset_type: &Symbol) {
     }
 }
 
+/// Type-to-assets index key: asset_type → Vec<u64> of asset IDs.
+fn type_assets_key(asset_type: &Symbol) -> (Symbol, Symbol) {
+    (symbol_short!("TYP_IDX"), asset_type.clone())
+}
+
+fn type_assets_add(env: &Env, asset_type: &Symbol, asset_id: u64) {
+    let key = type_assets_key(asset_type);
+    let mut ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    ids.push_back(asset_id);
+    env.storage().persistent().set(&key, &ids);
+    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+}
+
+fn type_assets_remove(env: &Env, asset_type: &Symbol, asset_id: u64) {
+    let key = type_assets_key(asset_type);
+    let ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    let mut updated: Vec<u64> = Vec::new(env);
+    for id in ids.iter() {
+        if id != asset_id {
+            updated.push_back(id);
+        }
+    }
+    env.storage().persistent().set(&key, &updated);
+    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+}
+
 /// Append an asset ID to the owner's index.
 fn owner_index_add(env: &Env, owner: &Address, asset_id: u64) {
     let key = owner_index_key(owner);
@@ -99,7 +138,7 @@ fn owner_index_add(env: &Env, owner: &Address, asset_id: u64) {
         .unwrap_or_else(|| Vec::new(env));
     ids.push_back(asset_id);
     env.storage().persistent().set(&key, &ids);
-    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 /// Remove an asset ID from the owner's index.
@@ -133,6 +172,8 @@ fn owner_index_remove(env: &Env, owner: &Address, asset_id: u64) {
         env.storage().persistent().set(&key, &updated);
         env.storage().persistent().extend_ttl(&key, 518400, 518400);
     }
+    env.storage().persistent().set(&key, &updated);
+    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn is_paused(env: &Env) -> bool {
@@ -196,18 +237,22 @@ impl AssetRegistry {
         env.storage().persistent().set(&asset_key(id), &asset);
         env.storage()
             .persistent()
-            .extend_ttl(&asset_key(id), 518400, 518400); // Extend TTL for persistent storage entries to prevent data loss
+            .extend_ttl(&asset_key(id), TTL_THRESHOLD, TTL_TARGET); // Extend TTL for persistent storage entries to prevent data loss
         env.storage().persistent().set(&ASSET_COUNT, &id);
         env.storage()
             .persistent()
-            .extend_ttl(&ASSET_COUNT, 518400, 518400);
+            .extend_ttl(&ASSET_COUNT, TTL_THRESHOLD, TTL_TARGET);
         env.storage().persistent().set(&dk, &id);
+        env.storage().persistent().extend_ttl(&dk, 518400, 518400);
 
         // Update owner index
         owner_index_add(&env, &owner, id);
 
         // Increment type count
         type_count_inc(&env, &asset_type);
+
+        // Update type-to-assets index
+        type_assets_add(&env, &asset_type, id);
 
         // Emit asset registration event
         env.events().publish(
@@ -271,18 +316,21 @@ impl AssetRegistry {
             env.storage().persistent().set(&asset_key(id), &asset);
             env.storage()
                 .persistent()
-                .extend_ttl(&asset_key(id), 518400, 518400);
+                .extend_ttl(&asset_key(id), TTL_THRESHOLD, TTL_TARGET);
             env.storage()
                 .persistent()
                 .set(&dedup_key(&owner, &meta_hash), &id);
             env.storage()
                 .persistent()
-                .extend_ttl(&dedup_key(&owner, &meta_hash), 518400, 518400);
+                .extend_ttl(&dedup_key(&owner, &meta_hash), TTL_THRESHOLD, TTL_TARGET);
 
             owner_index_add(&env, &owner, id);
 
             // Increment type count
             type_count_inc(&env, &asset_in.asset_type);
+
+            // Update type-to-assets index
+            type_assets_add(&env, &asset_in.asset_type, id);
 
             env.events().publish(
                 (symbol_short!("REG_AST"), id),
@@ -300,14 +348,14 @@ impl AssetRegistry {
             env.storage().persistent().set(&ASSET_COUNT, &next_id);
             env.storage()
                 .persistent()
-                .extend_ttl(&ASSET_COUNT, 518400, 518400);
+                .extend_ttl(&ASSET_COUNT, TTL_THRESHOLD, TTL_TARGET);
         }
 
         // Ensure owner index TTL is extended after all batch writes
         if !ids.is_empty() {
             env.storage()
                 .persistent()
-                .extend_ttl(&owner_index_key(&owner), 518400, 518400);
+                .extend_ttl(&owner_index_key(&owner), TTL_THRESHOLD, TTL_TARGET);
         }
 
         // Emit batch registration event
@@ -352,7 +400,7 @@ impl AssetRegistry {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         if env.storage().persistent().has(&key) {
-            env.storage().persistent().extend_ttl(&key, 518400, 518400);
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
         }
         ids
     }
@@ -394,6 +442,49 @@ impl AssetRegistry {
         env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0)
     }
 
+    /// Returns all asset IDs of the given type.
+    pub fn get_assets_by_type(env: Env, asset_type: Symbol) -> Vec<u64> {
+        let key = type_assets_key(&asset_type);
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, 518400, 518400);
+        }
+        ids
+    }
+
+    /// Returns a paginated list of asset IDs of the given type.
+    ///
+    /// # Arguments
+    /// * `asset_type` - The asset type symbol to query
+    /// * `offset` - Starting index for pagination
+    /// * `limit` - Maximum number of asset IDs to return
+    pub fn get_assets_by_type_page(
+        env: Env,
+        asset_type: Symbol,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<u64> {
+        let all: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&type_assets_key(&asset_type))
+            .unwrap_or_else(|| Vec::new(&env));
+        let len = all.len();
+        if offset >= len || limit == 0 {
+            return Vec::new(&env);
+        }
+        let end = (offset + limit).min(len);
+        let mut page = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(all.get(i).unwrap());
+        }
+        page
+    }
+
     /// Initialize the admin address for the contract.
     /// This function should be called once immediately after deployment.
     ///
@@ -408,7 +499,7 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
         }
         env.storage().instance().set(&ADMIN_KEY, &admin);
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Get the current admin address of the contract.
@@ -487,7 +578,7 @@ impl AssetRegistry {
         env.storage().persistent().set(&PAUSED_KEY, &true);
         env.storage()
             .persistent()
-            .extend_ttl(&PAUSED_KEY, 518400, 518400);
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish((symbol_short!("PAUSED"),), (admin,));
     }
 
@@ -504,7 +595,7 @@ impl AssetRegistry {
         env.storage().persistent().set(&PAUSED_KEY, &false);
         env.storage()
             .persistent()
-            .extend_ttl(&PAUSED_KEY, 518400, 518400);
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish((symbol_short!("UNPAUSED"),), (admin,));
     }
 
@@ -571,6 +662,9 @@ impl AssetRegistry {
         // Decrement type count
         type_count_dec(&env, &asset.asset_type);
 
+        // Remove from type-to-assets index
+        type_assets_remove(&env, &asset.asset_type, asset_id);
+
         // Emit deregistration event
         env.events().publish(
             (DEREG_TOPIC, asset_id),
@@ -629,13 +723,13 @@ impl AssetRegistry {
         env.storage().persistent().set(&new_dk, &asset_id);
         env.storage()
             .persistent()
-            .extend_ttl(&new_dk, 518400, 518400);
+            .extend_ttl(&new_dk, TTL_THRESHOLD, TTL_TARGET);
         asset.metadata = new_metadata.clone();
         asset.metadata_updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&asset_key(asset_id), &asset);
         env.storage()
             .persistent()
-            .extend_ttl(&asset_key(asset_id), 518400, 518400);
+            .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         env.events().publish(
             (symbol_short!("UPD_META"), asset_id),
@@ -685,7 +779,7 @@ impl AssetRegistry {
             .set(&dedup_key(&new_owner, &hash), &asset_id);
         env.storage()
             .persistent()
-            .extend_ttl(&dedup_key(&new_owner, &hash), 518400, 518400);
+            .extend_ttl(&dedup_key(&new_owner, &hash), TTL_THRESHOLD, TTL_TARGET);
 
         // Move owner index entry
         owner_index_remove(&env, &current_owner, asset_id);
@@ -695,7 +789,7 @@ impl AssetRegistry {
         env.storage().persistent().set(&asset_key(asset_id), &asset);
         env.storage()
             .persistent()
-            .extend_ttl(&asset_key(asset_id), 518400, 518400);
+            .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         env.events().publish(
             (symbol_short!("TRANSFER"), asset_id),
@@ -754,7 +848,7 @@ impl AssetRegistry {
             .set(&asset_type_key(&asset_type), &true);
         env.storage()
             .persistent()
-            .extend_ttl(&asset_type_key(&asset_type), 518400, 518400);
+            .extend_ttl(&asset_type_key(&asset_type), TTL_THRESHOLD, TTL_TARGET);
         env.events().publish((ADD_TYPE_TOPIC,), (asset_type,));
     }
 
@@ -1009,6 +1103,29 @@ mod tests {
             env.storage().persistent().get_ttl(&dk)
         });
         assert!(dedup_ttl > 0, "Deduplication key TTL should be extended");
+    }
+
+    #[test]
+    fn test_register_asset_dedup_key_ttl_is_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let metadata = String::from_str(&env, "Dedup TTL test asset");
+        client.register_asset(&symbol_short!("GENSET"), &metadata, &owner);
+
+        let meta_bytes = metadata.to_xdr(&env);
+        let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
+        let ttl = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&dedup_key(&owner, &meta_hash))
+        });
+        assert!(ttl > 0, "dedup key TTL must be extended after register_asset");
     }
 
     #[test]
@@ -2864,11 +2981,149 @@ mod tests {
         // Simulate TTL boundary: advance ledger sequence past the minimum TTL
         // then verify get_admin still returns the correct admin
         env.ledger().with_mut(|li| {
-            li.sequence_number += 518400;
-            li.timestamp += 518400 * 5;
+            li.sequence_number += TTL_THRESHOLD;
+            li.timestamp += TTL_THRESHOLD * 5;
         });
 
         // get_admin must still resolve correctly (TTL was extended at init time)
         assert_eq!(client.get_admin(), admin);
+    }
+
+    fn setup_with_types(env: &Env) -> (AssetRegistryClient, Address, Address) {
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        client.initialize_admin(&admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+        client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+        (client, admin, Address::generate(env))
+    }
+
+    #[test]
+    fn test_get_assets_by_type_registration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, owner) = setup_with_types(&env);
+
+        let id1 = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator A"),
+            &owner,
+        );
+        let id2 = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator B"),
+            &owner,
+        );
+        client.register_asset(
+            &symbol_short!("TURBINE"),
+            &String::from_str(&env, "Turbine X"),
+            &owner,
+        );
+
+        let gensets = client.get_assets_by_type(&symbol_short!("GENSET"));
+        assert_eq!(gensets.len(), 2);
+        assert_eq!(gensets.get(0).unwrap(), id1);
+        assert_eq!(gensets.get(1).unwrap(), id2);
+
+        let turbines = client.get_assets_by_type(&symbol_short!("TURBINE"));
+        assert_eq!(turbines.len(), 1);
+    }
+
+    #[test]
+    fn test_get_assets_by_type_after_deregister() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, owner) = setup_with_types(&env);
+
+        let id1 = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator A"),
+            &owner,
+        );
+        let id2 = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator B"),
+            &owner,
+        );
+
+        client.deregister_asset(&admin, &id1);
+
+        let gensets = client.get_assets_by_type(&symbol_short!("GENSET"));
+        assert_eq!(gensets.len(), 1);
+        assert_eq!(gensets.get(0).unwrap(), id2);
+    }
+
+    #[test]
+    fn test_get_assets_by_type_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, owner) = setup_with_types(&env);
+
+        let metas = [
+            "Generator 0",
+            "Generator 1",
+            "Generator 2",
+            "Generator 3",
+            "Generator 4",
+        ];
+        let mut ids: Vec<u64> = Vec::new(&env);
+        for meta in metas.iter() {
+            ids.push_back(client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, meta),
+                &owner,
+            ));
+        }
+
+        // Page 0: first 2
+        let page0 = client.get_assets_by_type_page(&symbol_short!("GENSET"), &0, &2);
+        assert_eq!(page0.len(), 2);
+        assert_eq!(page0.get(0).unwrap(), ids.get(0).unwrap());
+        assert_eq!(page0.get(1).unwrap(), ids.get(1).unwrap());
+
+        // Page 1: next 2
+        let page1 = client.get_assets_by_type_page(&symbol_short!("GENSET"), &2, &2);
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1.get(0).unwrap(), ids.get(2).unwrap());
+
+        // Last page: 1 item
+        let page2 = client.get_assets_by_type_page(&symbol_short!("GENSET"), &4, &2);
+        assert_eq!(page2.len(), 1);
+
+        // Out-of-bounds offset returns empty
+        let empty = client.get_assets_by_type_page(&symbol_short!("GENSET"), &10, &2);
+        assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    fn test_get_assets_by_type_batch_register() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, owner) = setup_with_types(&env);
+
+        let assets = soroban_sdk::vec![
+            &env,
+            AssetInput {
+                asset_type: symbol_short!("GENSET"),
+                metadata: String::from_str(&env, "Generator Batch 1"),
+            },
+            AssetInput {
+                asset_type: symbol_short!("GENSET"),
+                metadata: String::from_str(&env, "Generator Batch 2"),
+            },
+            AssetInput {
+                asset_type: symbol_short!("TURBINE"),
+                metadata: String::from_str(&env, "Turbine Batch 1"),
+            },
+        ];
+
+        client.batch_register_assets(&owner, &assets);
+
+        let gensets = client.get_assets_by_type(&symbol_short!("GENSET"));
+        assert_eq!(gensets.len(), 2);
+
+        let turbines = client.get_assets_by_type(&symbol_short!("TURBINE"));
+        assert_eq!(turbines.len(), 1);
     }
 }
