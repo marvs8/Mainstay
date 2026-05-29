@@ -114,13 +114,15 @@ impl LendingContract {
     /// Vouch for a borrower with a stake.
     ///
     /// # Errors
-    /// - [`ContractError::ZeroStake`] if stake is 0 (#621)
+    /// - [`ContractError::ZeroStake`] if stake is 0 — prevents zero-stake
+    ///   vouches that inflate vouch count without contributing to the
+    ///   threshold (#621)
     /// - [`ContractError::DuplicateVouch`] if the same voucher has already
     ///   vouched for this borrower, preventing unlimited vouch stacking (#620)
     pub fn vouch(env: Env, borrower: Address, voucher: Address, stake: u64) {
         voucher.require_auth();
 
-        // #621: reject zero-stake vouches
+        // #621: stake must be > 0 to count toward the vouch threshold
         if stake == 0 {
             panic_with_error!(&env, ContractError::ZeroStake);
         }
