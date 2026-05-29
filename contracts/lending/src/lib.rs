@@ -109,9 +109,12 @@ impl LendingContract {
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
     }
 
-    /// Vouch for a borrower with a stake. Panics with:
+    /// Vouch for a borrower with a stake.
+    ///
+    /// # Errors
     /// - [`ContractError::ZeroStake`] if stake is 0 (#621)
-    /// - [`ContractError::DuplicateVouch`] if voucher already vouched for this borrower (#620)
+    /// - [`ContractError::DuplicateVouch`] if the same voucher has already
+    ///   vouched for this borrower, preventing unlimited vouch stacking (#620)
     pub fn vouch(env: Env, borrower: Address, voucher: Address, stake: u64) {
         voucher.require_auth();
 
@@ -127,7 +130,7 @@ impl LendingContract {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
 
-        // #620: reject duplicate vouches from the same voucher
+        // #620: each voucher address may only vouch once per borrower
         for v in vouches.iter() {
             if v.voucher == voucher {
                 panic_with_error!(&env, ContractError::DuplicateVouch);
