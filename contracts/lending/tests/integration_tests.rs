@@ -243,3 +243,60 @@ fn test_borrower_record_created_on_loan_request() {
     let score_after = client.get_credit_score(&borrower);
     assert_eq!(score_after, 0);
 }
+
+#[test]
+fn test_repayment_count_increments() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token_addr, _token_admin) = setup_contract(&env);
+
+    let borrower = Address::generate(&env);
+    let voucher = Address::generate(&env);
+
+    let token_client = token::Client::new(&env, &token_addr);
+    token_client.mint(&voucher, &10000);
+    token_client.mint(&env.current_contract_address(), &10000);
+
+    client.vouch(&borrower, &voucher, &1000);
+    client.request_loan(&borrower, &5000);
+    client.repay(&borrower);
+
+    let score1 = client.get_credit_score(&borrower);
+    assert_eq!(score1, 100);
+
+    client.vouch(&borrower, &voucher, &1000);
+    client.request_loan(&borrower, &5000);
+    client.repay(&borrower);
+
+    let score2 = client.get_credit_score(&borrower);
+    assert_eq!(score2, 100);
+}
+
+#[test]
+fn test_default_count_increments() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token_addr, _token_admin) = setup_contract(&env);
+
+    let borrower = Address::generate(&env);
+    let voucher = Address::generate(&env);
+
+    let token_client = token::Client::new(&env, &token_addr);
+    token_client.mint(&voucher, &10000);
+
+    client.vouch(&borrower, &voucher, &1000);
+    client.request_loan(&borrower, &5000);
+    client.slash(&admin, &borrower);
+
+    let score1 = client.get_credit_score(&borrower);
+    assert_eq!(score1, 0);
+
+    client.vouch(&borrower, &voucher, &1000);
+    client.request_loan(&borrower, &5000);
+    client.slash(&admin, &borrower);
+
+    let score2 = client.get_credit_score(&borrower);
+    assert_eq!(score2, 0);
+}
