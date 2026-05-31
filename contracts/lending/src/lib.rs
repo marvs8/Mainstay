@@ -51,6 +51,7 @@ pub struct Loan {
     pub borrower: Address,
     pub amount: u64,
     pub status: LoanStatus,
+    pub deadline: u64,
 }
 
 #[contracttype]
@@ -138,6 +139,27 @@ fn require_admin(env: &Env, caller: &Address) {
     }
 }
 
+fn require_not_paused(env: &Env) {
+    let paused: bool = env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false);
+    if paused {
+        panic_with_error!(env, ContractError::ContractPaused);
+    }
+}
+
+fn get_slash_bps(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&SLASH_BPS_KEY)
+        .unwrap_or(5000)
+}
+
+fn get_loan_duration(env: &Env) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&LOAN_DURATION_KEY)
+        .unwrap_or(2_592_000)
+}
+
 #[contract]
 pub struct LendingContract;
 
@@ -150,7 +172,7 @@ impl LendingContract {
     /// of the deployment transaction can race to call `initialize` first,
     /// setting themselves as admin (#625). Call this in the same transaction as
     /// contract deployment to eliminate the front-run window entirely.
-    pub fn initialize(env: Env, deployer: Address, admin: Address, token: Address) {
+    pub fn initialize(env: Env, deployer: Address, admin: Address, token: Address, slash_bps: u32) {
         // #625: Require the deployer's signature to prevent front-running.
         deployer.require_auth();
 
@@ -187,6 +209,7 @@ impl LendingContract {
     /// Panics with [`ContractError::LoanAlreadyActive`] if the borrower
     /// already has a non-repaid, non-defaulted loan.
     pub fn request_loan(env: Env, borrower: Address, amount: u64) {
+        require_not_paused(&env);
         borrower.require_auth();
 
         let key = loan_key(&borrower);
@@ -209,6 +232,7 @@ impl LendingContract {
             borrower: borrower.clone(),
             amount,
             status: LoanStatus::Active,
+            deadline,
         };
         env.storage().persistent().set(&key, &loan);
         env.storage()
@@ -239,6 +263,7 @@ impl LendingContract {
     /// 
     /// The caller must match the loan's borrower address (#645).
     pub fn repay(env: Env, borrower: Address) {
+        require_not_paused(&env);
         borrower.require_auth();
 
         let key = loan_key(&borrower);
@@ -315,6 +340,7 @@ impl LendingContract {
     ///   this borrower
     /// - [`ContractError::TooManyVouchers`] if loan already has 100 vouchers (#633, #634)
     pub fn vouch(env: Env, borrower: Address, voucher: Address, stake: u64) {
+        require_not_paused(&env);
         voucher.require_auth();
 
         // #629: Prevent borrower from vouching for themselves
@@ -387,9 +413,9 @@ impl LendingContract {
             .extend_ttl(&hist_key, TTL_THRESHOLD, TTL_TARGET);
     }
 
-    /// Admin-only: mark a loan as defaulted and slash 50% of each voucher's stake.
+    /// Admin-only: mark a loan as defaulted and slash based on configured rate.
     ///
-    /// The slashed half is accumulated in `slash_balance`; the other half is
+    /// The slashed amount is accumulated in `slash_balance`; the remainder is
     /// returned to the voucher. The accumulated balance can be withdrawn by the
     /// admin via [`slash_treasury`] (#626).
     ///
@@ -432,8 +458,7 @@ impl LendingContract {
         let token_addr = get_token(&env);
         let tok = token::Client::new(&env, &token_addr);
 
-        // #626: Accumulate slashed amounts into slash_balance instead of
-        // leaving them permanently locked in the contract.
+        let slash_bps = get_slash_bps(&env);
         let mut slash_accum: u64 = 0;
         for v in vouches.iter() {
             let slashed = v.stake * SLASH_BPS / 10_000;
