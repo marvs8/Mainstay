@@ -84,6 +84,10 @@ fn vouches_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("VOUCHES"), borrower.clone())
 }
 
+fn voucher_history_key(voucher: &Address) -> (soroban_sdk::Symbol, Address) {
+    (symbol_short!("V_HIST"), voucher.clone())
+}
+
 fn get_admin(env: &Env) -> Address {
     env.storage()
         .persistent()
@@ -269,6 +273,18 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        let hist_key = voucher_history_key(&voucher);
+        let mut history: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&hist_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        history.push_back(borrower);
+        env.storage().persistent().set(&hist_key, &history);
+        env.storage()
+            .persistent()
+            .extend_ttl(&hist_key, TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Admin-only: mark a loan as defaulted and slash 50% of each voucher's stake.
@@ -388,5 +404,13 @@ impl LendingContract {
         let token_addr = get_token(&env);
         let tok = token::Client::new(&env, &token_addr);
         tok.balance(&env.current_contract_address())
+    }
+
+    /// Returns all borrowers that a given voucher has backed.
+    pub fn voucher_history(env: Env, voucher: Address) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&voucher_history_key(&voucher))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 }
