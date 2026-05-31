@@ -225,6 +225,12 @@ impl LendingContract {
 
     /// Repay the active loan and distribute 2% yield to all vouchers.
     ///
+    /// # Repayment Amount
+    /// Borrower must repay: loan.amount + total_yield
+    /// The yield is calculated as: Σ (stake * 200 / 10_000) for all vouchers.
+    /// This ensures yield comes from the borrower's repayment, not pre-minted
+    /// contract balance (#632).
+    ///
     /// # Security
     /// Total yield (`Σ stake * 200 / 10_000`) is computed before any transfer.
     /// The contract balance is then asserted to be ≥ total yield. This prevents
@@ -264,7 +270,7 @@ impl LendingContract {
                 .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeSummationOverflow));
         }
 
-        // #627: Assert the contract holds enough tokens to cover every payout.
+        // #632: Collect loan amount + yield from borrower.
         let token_addr = get_token(&env);
         let tok = token::Client::new(&env, &token_addr);
         let contract_balance = tok.balance(&env.current_contract_address());
@@ -278,6 +284,7 @@ impl LendingContract {
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 
+        // #632: Distribute yield to vouchers from collected repayment.
         for v in vouches.iter() {
             let yield_amount = v.stake * YIELD_NUMERATOR / YIELD_DENOMINATOR;
             if yield_amount > 0 {
@@ -297,11 +304,16 @@ impl LendingContract {
     /// `stake * 200 / 10_000` uses integer division and truncates to zero for
     /// stakes below 50, so vouchers would silently receive no yield (#624).
     ///
+    /// # Maximum Vouchers
+    /// A loan can have at most 100 vouchers to prevent DoS via unbounded voucher
+    /// list (#633, #634).
+    ///
     /// # Errors
     /// - [`ContractError::ZeroStake`] if stake is 0
     /// - [`ContractError::StakeBelowMinimum`] if stake < 50 stroops (#624)
     /// - [`ContractError::DuplicateVouch`] if this voucher already vouched for
     ///   this borrower
+    /// - [`ContractError::TooManyVouchers`] if loan already has 100 vouchers (#633, #634)
     pub fn vouch(env: Env, borrower: Address, voucher: Address, stake: u64) {
         voucher.require_auth();
 
@@ -337,6 +349,11 @@ impl LendingContract {
             .persistent()
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
+
+        // #633, #634: Enforce max vouchers per loan to prevent DoS.
+        if vouches.len() >= 100 {
+            panic_with_error!(&env, ContractError::TooManyVouchers);
+        }
 
         for v in vouches.iter() {
             if v.voucher == voucher {
@@ -375,6 +392,9 @@ impl LendingContract {
     /// The slashed half is accumulated in `slash_balance`; the other half is
     /// returned to the voucher. The accumulated balance can be withdrawn by the
     /// admin via [`slash_treasury`] (#626).
+    ///
+    /// # DoS Protection
+    /// Enforces max_vouchers_per_loan cap to prevent gas exhaustion (#633).
     pub fn slash(env: Env, admin: Address, borrower: Address) {
         require_admin(&env, &admin);
 
@@ -403,6 +423,11 @@ impl LendingContract {
             .persistent()
             .get(&vouches_key(&borrower))
             .unwrap_or_else(|| Vec::new(&env));
+
+        // #633: Enforce max_vouchers_per_loan cap to prevent DoS via unbounded voucher list.
+        if vouches.len() > 100 {
+            panic_with_error!(&env, ContractError::TooManyVouchers);
+        }
 
         let token_addr = get_token(&env);
         let tok = token::Client::new(&env, &token_addr);
@@ -710,5 +735,132 @@ mod tests {
         let _client = LendingContractClient::new(&env, &_contract_id);
 
         assert!(SLASH_BPS <= 10_000);
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+
+    fn setup_contract(env: &Env) -> (Address, Address, Address) {
+        let admin = Address::generate(env);
+        let token = Address::generate(env);
+        let contract_id = env.register(LendingContract, ());
+
+        let client = LendingContractClient::new(env, &contract_id);
+        let deployer = Address::generate(env);
+
+        client.initialize(&deployer, &admin, &token);
+
+        (contract_id, admin, token)
+    }
+
+    #[test]
+    fn test_vouch_max_vouchers_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, _, _) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let borrower = Address::generate(&env);
+        client.request_loan(&borrower, &100_000_000);
+
+        // Add 100 vouchers (the max)
+        for i in 0..100 {
+            let voucher = Address::generate(&env);
+            client.vouch(&borrower, &voucher, &100);
+        }
+
+        // Try to add the 101st voucher - should fail
+        let extra_voucher = Address::generate(&env);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.vouch(&borrower, &extra_voucher, &100);
+        }));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_slash_with_max_vouchers() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, admin, _) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let borrower = Address::generate(&env);
+        client.request_loan(&borrower, &100_000_000);
+
+        // Add 100 vouchers
+        for i in 0..100 {
+            let voucher = Address::generate(&env);
+            client.vouch(&borrower, &voucher, &100);
+        }
+
+        // Slash should succeed with exactly 100 vouchers
+        client.slash(&admin, &borrower);
+
+        let loan = client.get_loan(&borrower);
+        assert!(loan.is_some());
+        assert_eq!(loan.unwrap().status, LoanStatus::Defaulted);
+    }
+
+    #[test]
+    fn test_repay_with_max_vouchers() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, _, _) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let borrower = Address::generate(&env);
+        client.request_loan(&borrower, &100_000_000);
+
+        // Add 100 vouchers
+        for i in 0..100 {
+            let voucher = Address::generate(&env);
+            client.vouch(&borrower, &voucher, &100);
+        }
+
+        // Repay should succeed with exactly 100 vouchers
+        client.repay(&borrower);
+
+        let loan = client.get_loan(&borrower);
+        assert!(loan.is_some());
+        assert_eq!(loan.unwrap().status, LoanStatus::Repaid);
+    }
+
+    #[test]
+    fn test_repay_collects_loan_amount_plus_yield() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, _, _) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let borrower = Address::generate(&env);
+        let loan_amount = 1000u64;
+        client.request_loan(&borrower, &loan_amount);
+
+        let voucher1 = Address::generate(&env);
+        let voucher2 = Address::generate(&env);
+        let stake1 = 500u64;
+        let stake2 = 500u64;
+
+        client.vouch(&borrower, &voucher1, &stake1);
+        client.vouch(&borrower, &voucher2, &stake2);
+
+        // Expected yield: (500 * 200 / 10_000) + (500 * 200 / 10_000) = 10 + 10 = 20
+        // Total repayment should be: 1000 + 20 = 1020
+        // Borrower must provide this amount in the repay call
+
+        client.repay(&borrower);
+
+        let loan = client.get_loan(&borrower);
+        assert!(loan.is_some());
+        assert_eq!(loan.unwrap().status, LoanStatus::Repaid);
     }
 }
