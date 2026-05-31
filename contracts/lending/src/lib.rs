@@ -71,8 +71,8 @@ pub struct Config {
 const TTL_THRESHOLD: u32 = 518_400;
 const TTL_TARGET: u32 = 518_400;
 
-/// Yield rate numerator: 2% = 200 / 10_000.
-const YIELD_NUMERATOR: u64 = 200;
+/// Default yield rate numerator: 2% = 200 / 10_000.
+const DEFAULT_YIELD_NUMERATOR: u64 = 200;
 const YIELD_DENOMINATOR: u64 = 10_000;
 
 /// Slash basis points: 50% = 5000 / 10_000 (#646).
@@ -165,7 +165,7 @@ pub struct LendingContract;
 
 #[contractimpl]
 impl LendingContract {
-    /// Initialize the lending contract with an admin and a payment token.
+    /// Initialize the lending contract with an admin, payment token, and yield rate.
     ///
     /// # Security
     /// `deployer` must sign this transaction. Without this guard any observer
@@ -247,7 +247,7 @@ impl LendingContract {
         );
     }
 
-    /// Repay the active loan and distribute 2% yield to all vouchers.
+    /// Repay the active loan and distribute yield to all vouchers.
     ///
     /// # Repayment Amount
     /// Borrower must repay: loan.amount + total_yield
@@ -256,7 +256,7 @@ impl LendingContract {
     /// contract balance (#632).
     ///
     /// # Security
-    /// Total yield (`Σ stake * 200 / 10_000`) is computed before any transfer.
+    /// Total yield is computed before any transfer.
     /// The contract balance is then asserted to be ≥ total yield. This prevents
     /// the loop from panicking mid-execution when the contract is underfunded
     /// (#627).
@@ -286,6 +286,12 @@ impl LendingContract {
             .get(&vouches_key(&borrower))
             .unwrap_or_else(|| Vec::new(&env));
 
+        let yield_bps: u64 = env
+            .storage()
+            .persistent()
+            .get(&YIELD_BPS_KEY)
+            .unwrap_or(DEFAULT_YIELD_NUMERATOR);
+
         // #627: Pre-calculate total yield before touching any balances.
         // #643: Use checked addition to prevent overflow.
         let mut total_yield: i128 = 0;
@@ -311,7 +317,7 @@ impl LendingContract {
 
         // #632: Distribute yield to vouchers from collected repayment.
         for v in vouches.iter() {
-            let yield_amount = v.stake * YIELD_NUMERATOR / YIELD_DENOMINATOR;
+            let yield_amount = v.stake * yield_bps / YIELD_DENOMINATOR;
             if yield_amount > 0 {
                 tok.transfer(
                     &env.current_contract_address(),
@@ -443,6 +449,21 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        let borrower_key_val = borrower_key(&borrower);
+        if let Some(mut borrower_record) = env
+            .storage()
+            .persistent()
+            .get::<_, Borrower>(&borrower_key_val)
+        {
+            borrower_record.default_count += 1;
+            env.storage()
+                .persistent()
+                .set(&borrower_key_val, &borrower_record);
+            env.storage()
+                .persistent()
+                .extend_ttl(&borrower_key_val, TTL_THRESHOLD, TTL_TARGET);
+        }
 
         let vouches: Vec<Vouch> = env
             .storage()
