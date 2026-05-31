@@ -410,4 +410,19 @@ impl LendingContract {
         }
         false
     }
+
+    /// Return the total staked amount for a borrower across all vouchers.
+    pub fn total_vouched(env: Env, borrower: Address) -> i128 {
+        let vouches: Vec<Vouch> = env
+            .storage()
+            .persistent()
+            .get(&vouches_key(&borrower))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut total: u64 = 0;
+        for v in vouches.iter() {
+            total += v.stake;
+        }
+        total as i128
+    }
 }
