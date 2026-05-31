@@ -75,6 +75,7 @@ const MIN_VOUCH_STAKE: u64 = 50;
 const ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("ADMIN");
 const TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("TOKEN");
 const SLASH_BAL: soroban_sdk::Symbol = symbol_short!("SL_BAL");
+const MIN_STAKE_KEY: soroban_sdk::Symbol = symbol_short!("MIN_STK");
 
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("LOAN"), borrower.clone())
@@ -137,6 +138,10 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&TOKEN_KEY, TTL_THRESHOLD, TTL_TARGET);
+        env.storage().persistent().set(&MIN_STAKE_KEY, &MIN_VOUCH_STAKE);
+        env.storage()
+            .persistent()
+            .extend_ttl(&MIN_STAKE_KEY, TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Request a new loan for the borrower.
@@ -243,8 +248,12 @@ impl LendingContract {
             panic_with_error!(&env, ContractError::ZeroStake);
         }
 
-        // #624: Reject stakes that yield zero due to integer truncation.
-        if stake < MIN_VOUCH_STAKE {
+        let min_stake: u64 = env
+            .storage()
+            .persistent()
+            .get(&MIN_STAKE_KEY)
+            .unwrap_or(MIN_VOUCH_STAKE);
+        if stake < min_stake {
             panic_with_error!(&env, ContractError::StakeBelowMinimum);
         }
 
@@ -412,5 +421,14 @@ impl LendingContract {
             .persistent()
             .get(&voucher_history_key(&voucher))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Admin-only: set the minimum vouch stake amount.
+    pub fn set_min_stake(env: Env, admin: Address, amount: u64) {
+        require_admin(&env, &admin);
+        env.storage().persistent().set(&MIN_STAKE_KEY, &amount);
+        env.storage()
+            .persistent()
+            .extend_ttl(&MIN_STAKE_KEY, TTL_THRESHOLD, TTL_TARGET);
     }
 }
