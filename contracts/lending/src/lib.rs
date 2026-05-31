@@ -27,6 +27,10 @@ pub enum ContractError {
     InsufficientFunds = 8,
     /// Stake is below the minimum required for non-zero yield (50 stroops).
     StakeBelowMinimum = 9,
+    /// Loan has exceeded its repayment deadline.
+    LoanDeadlineExceeded = 10,
+    /// Contract is paused.
+    ContractPaused = 11,
 }
 
 #[contracttype]
@@ -44,6 +48,7 @@ pub struct Loan {
     pub borrower: Address,
     pub amount: u64,
     pub status: LoanStatus,
+    pub deadline: u64,
 }
 
 #[contracttype]
@@ -75,6 +80,10 @@ const MIN_VOUCH_STAKE: u64 = 50;
 const ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("ADMIN");
 const TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("TOKEN");
 const SLASH_BAL: soroban_sdk::Symbol = symbol_short!("SL_BAL");
+const SLASH_BPS_KEY: soroban_sdk::Symbol = symbol_short!("SLASH_BPS");
+const LOAN_DURATION_KEY: soroban_sdk::Symbol = symbol_short!("LOAN_DUR");
+const PAUSED_KEY: soroban_sdk::Symbol = symbol_short!("PAUSED");
+const PENDING_ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("PEND_ADM");
 
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("LOAN"), borrower.clone())
@@ -105,6 +114,27 @@ fn require_admin(env: &Env, caller: &Address) {
     }
 }
 
+fn require_not_paused(env: &Env) {
+    let paused: bool = env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false);
+    if paused {
+        panic_with_error!(env, ContractError::ContractPaused);
+    }
+}
+
+fn get_slash_bps(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&SLASH_BPS_KEY)
+        .unwrap_or(5000)
+}
+
+fn get_loan_duration(env: &Env) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&LOAN_DURATION_KEY)
+        .unwrap_or(2_592_000)
+}
+
 #[contract]
 pub struct LendingContract;
 
@@ -117,7 +147,7 @@ impl LendingContract {
     /// of the deployment transaction can race to call `initialize` first,
     /// setting themselves as admin (#625). Call this in the same transaction as
     /// contract deployment to eliminate the front-run window entirely.
-    pub fn initialize(env: Env, deployer: Address, admin: Address, token: Address) {
+    pub fn initialize(env: Env, deployer: Address, admin: Address, token: Address, slash_bps: u32) {
         // #625: Require the deployer's signature to prevent front-running.
         deployer.require_auth();
 
@@ -133,6 +163,10 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&TOKEN_KEY, TTL_THRESHOLD, TTL_TARGET);
+        env.storage().persistent().set(&SLASH_BPS_KEY, &slash_bps);
+        env.storage()
+            .persistent()
+            .extend_ttl(&SLASH_BPS_KEY, TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Request a new loan for the borrower.
@@ -140,6 +174,7 @@ impl LendingContract {
     /// Panics with [`ContractError::LoanAlreadyActive`] if the borrower
     /// already has a non-repaid, non-defaulted loan.
     pub fn request_loan(env: Env, borrower: Address, amount: u64) {
+        require_not_paused(&env);
         borrower.require_auth();
 
         let key = loan_key(&borrower);
@@ -150,10 +185,12 @@ impl LendingContract {
             }
         }
 
+        let deadline = env.ledger().timestamp() + get_loan_duration(&env);
         let loan = Loan {
             borrower: borrower.clone(),
             amount,
             status: LoanStatus::Active,
+            deadline,
         };
         env.storage().persistent().set(&key, &loan);
         env.storage()
@@ -169,6 +206,7 @@ impl LendingContract {
     /// the loop from panicking mid-execution when the contract is underfunded
     /// (#627).
     pub fn repay(env: Env, borrower: Address) {
+        require_not_paused(&env);
         borrower.require_auth();
 
         let key = loan_key(&borrower);
@@ -233,6 +271,7 @@ impl LendingContract {
     /// - [`ContractError::DuplicateVouch`] if this voucher already vouched for
     ///   this borrower
     pub fn vouch(env: Env, borrower: Address, voucher: Address, stake: u64) {
+        require_not_paused(&env);
         voucher.require_auth();
 
         if stake == 0 {
@@ -271,9 +310,9 @@ impl LendingContract {
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
     }
 
-    /// Admin-only: mark a loan as defaulted and slash 50% of each voucher's stake.
+    /// Admin-only: mark a loan as defaulted and slash based on configured rate.
     ///
-    /// The slashed half is accumulated in `slash_balance`; the other half is
+    /// The slashed amount is accumulated in `slash_balance`; the remainder is
     /// returned to the voucher. The accumulated balance can be withdrawn by the
     /// admin via [`slash_treasury`] (#626).
     pub fn slash(env: Env, admin: Address, borrower: Address) {
@@ -305,11 +344,10 @@ impl LendingContract {
         let token_addr = get_token(&env);
         let tok = token::Client::new(&env, &token_addr);
 
-        // #626: Accumulate slashed amounts into slash_balance instead of
-        // leaving them permanently locked in the contract.
+        let slash_bps = get_slash_bps(&env);
         let mut slash_accum: u64 = 0;
         for v in vouches.iter() {
-            let slashed = v.stake / 2;
+            let slashed = v.stake * (slash_bps as u64) / 10_000;
             let returned = v.stake - slashed;
             slash_accum += slashed;
             if returned > 0 {
@@ -381,5 +419,73 @@ impl LendingContract {
             .persistent()
             .get(&SLASH_BAL)
             .unwrap_or(0u64)
+    }
+
+    /// Auto-slash a loan after its deadline has passed. Callable by anyone.
+    pub fn auto_slash(env: Env, borrower: Address) {
+        let key = loan_key(&borrower);
+        let loan: Loan = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoActiveLoan));
+
+        if loan.status != LoanStatus::Active {
+            panic_with_error!(&env, ContractError::NoActiveLoan);
+        }
+
+        if env.ledger().timestamp() <= loan.deadline {
+            panic_with_error!(&env, ContractError::LoanDeadlineExceeded);
+        }
+
+        let admin = get_admin(&env);
+        Self::slash(env, admin, borrower);
+    }
+
+    /// Admin-only: pause the contract, disabling critical functions.
+    pub fn pause(env: Env, admin: Address) {
+        require_admin(&env, &admin);
+        env.storage().persistent().set(&PAUSED_KEY, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Admin-only: unpause the contract.
+    pub fn unpause(env: Env, admin: Address) {
+        require_admin(&env, &admin);
+        env.storage().persistent().set(&PAUSED_KEY, &false);
+        env.storage()
+            .persistent()
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Admin-only: propose a new admin. The proposed admin must accept.
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
+        require_admin(&env, &admin);
+        env.storage().persistent().set(&PENDING_ADMIN_KEY, &new_admin);
+        env.storage()
+            .persistent()
+            .extend_ttl(&PENDING_ADMIN_KEY, TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Accept admin role if you are the pending admin.
+    pub fn accept_admin(env: Env, caller: Address) {
+        caller.require_auth();
+        let pending: Address = env
+            .storage()
+            .persistent()
+            .get(&PENDING_ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::UnauthorizedAdmin));
+
+        if pending != caller {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        env.storage().persistent().set(&ADMIN_KEY, &caller);
+        env.storage()
+            .persistent()
+            .extend_ttl(&ADMIN_KEY, TTL_THRESHOLD, TTL_TARGET);
+        env.storage().persistent().remove(&PENDING_ADMIN_KEY);
     }
 }

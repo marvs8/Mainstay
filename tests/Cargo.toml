@@ -8,6 +8,7 @@ publish = false
 asset-registry = { path = "../contracts/asset-registry" }
 engineer-registry = { path = "../contracts/engineer-registry" }
 lifecycle = { path = "../contracts/lifecycle" }
+lending = { path = "../contracts/lending" }
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
 
 [[test]]
@@ -17,3 +18,7 @@ path = "cross_platform_tests.rs"
 [[test]]
 name = "test_full_lifecycle_e2e"
 path = "test_full_lifecycle_e2e.rs"
+
+[[test]]
+name = "test_lending_features"
+path = "test_lending_features.rs"
