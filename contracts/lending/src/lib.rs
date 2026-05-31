@@ -382,4 +382,33 @@ impl LendingContract {
             .get(&SLASH_BAL)
             .unwrap_or(0u64)
     }
+
+    /// Returns whether the contract has been initialized.
+    pub fn is_initialized(env: Env) -> bool {
+        env.storage().persistent().has(&ADMIN_KEY)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn test_is_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        assert!(!client.is_initialized());
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&deployer, &admin, &token);
+        assert!(client.is_initialized());
+    }
 }
