@@ -31,6 +31,8 @@ pub enum ContractError {
     ProposalNotFound = 17,
     EngineerNotAuthorized = 16,
     ScoreOverflow = 16,
+    /// Notes field exceeds the configured maximum length.
+    NotesTooLong = 18,
 }
 
 #[contracttype]
@@ -497,7 +499,7 @@ fn validate_notes_length(env: &Env, notes: &soroban_sdk::String, max: u32) {
         panic_with_error!(env, ContractError::InvalidConfig);
     }
     if notes.len() > max {
-        panic_with_error!(env, ContractError::InvalidConfig);
+        panic_with_error!(env, ContractError::NotesTooLong);
     }
 }
 
@@ -1347,7 +1349,6 @@ impl Lifecycle {
         // Validate records early before cross-contract calls
         require_non_empty_vec(&records, "records");
         for record in records.iter() {
-            require_string_length(&record.notes, "notes", config.max_notes_length);
             validate_notes_length(&env, &record.notes, config.max_notes_length);
             // Validate task type is known
             let _ = get_task_weight(&env, &record.task_type);
@@ -2290,11 +2291,21 @@ mod tests {
         )
     }
 
+    /// Generate a unique serial number string for each test asset registration.
+    fn unique_serial(env: &Env) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        String::from_str(env, &std::format!("SN-{n}"))
+    }
+
     fn register_asset(env: &Env, registry_client: &AssetRegistryClient) -> u64 {
         let owner = Address::generate(env);
+        let serial = unique_serial(env);
         registry_client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(env, "Caterpillar 3516"),
+            &serial,
             &owner,
         )
     }
@@ -2304,9 +2315,11 @@ mod tests {
         registry_client: &AssetRegistryClient,
         owner: &Address,
     ) -> u64 {
+        let serial = unique_serial(env);
         registry_client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(env, "Caterpillar 3516"),
+            &serial,
             owner,
         )
     }
@@ -2585,7 +2598,7 @@ mod tests {
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidConfig as u32,
+                ContractError::NotesTooLong as u32,
             ))),
         );
     }
@@ -4654,7 +4667,7 @@ mod tests {
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidConfig as u32,
+                ContractError::NotesTooLong as u32,
             ))),
         );
     }
