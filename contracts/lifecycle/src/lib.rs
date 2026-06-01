@@ -1407,7 +1407,7 @@ impl Lifecycle {
     /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
     pub fn get_maintenance_history(env: Env, asset_id: u64) -> Vec<MaintenanceRecord> {
         let asset_registry = get_asset_registry_addr(&env);
-        asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
         env.storage()
             .persistent()
             .get(&history_key(asset_id))
@@ -2319,7 +2319,7 @@ mod tests {
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
-                asset_registry::ContractError::AssetNotFound as u32,
+                ContractError::AssetNotFound as u32,
             ))),
         );
     }
