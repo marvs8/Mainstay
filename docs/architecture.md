@@ -63,6 +63,12 @@ The orchestration contract. Binds AssetRegistry and EngineerRegistry together to
 - Expose score trend queries (`get_score_trend`, `get_score_history`)
 - Admin-gated configuration updates (score increment, decay rate/interval) and upgrade path
 
+**DoS protection — `MAX_RECORDS_PER_ASSET`:**
+
+Maintenance history is stored as a `Vec<MaintenanceRecord>` in Soroban persistent storage. Without a bound, an attacker could submit thousands of records to a single asset, causing `get_maintenance_history` and score-calculation reads to exceed the Stellar ledger instruction limit (fix for [#567](https://github.com/marvs8/Mainstay/issues/567)).
+
+`MAX_RECORDS_PER_ASSET = 200` is a compile-time constant that acts as a hard ceiling. `submit_maintenance` enforces `cap = config.max_history.min(MAX_RECORDS_PER_ASSET)` and returns `HistoryCapReached` when the limit is reached. The admin can lower `max_history` via `update_max_history`, but can never raise it above `MAX_RECORDS_PER_ASSET`.
+
 **Task weight table:**
 | Tasks | Points |
 |-------|--------|

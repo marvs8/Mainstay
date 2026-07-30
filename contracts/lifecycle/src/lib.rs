@@ -29,6 +29,10 @@ const CONFIG: Symbol = symbol_short!("CONFIG");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
 const DEFAULT_MAX_HISTORY: u32 = 200;
+/// Hard upper bound on maintenance records stored per asset.
+/// Prevents unbounded Vec growth that would exceed the ledger instruction limit
+/// (fix for DoS vector reported in issue #567).
+pub const MAX_RECORDS_PER_ASSET: u32 = DEFAULT_MAX_HISTORY;
 const DEFAULT_SCORE_INCREMENT: u32 = 5;
 const DEFAULT_DECAY_RATE: u32 = 5;
 const DEFAULT_DECAY_INTERVAL: u64 = DEFAULT_DECAY_INTERVAL_SECS;
@@ -7624,6 +7628,44 @@ mod tests {
 
         // No records written ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â history still at 2
         assert_eq!(client.get_maintenance_history(&asset_id).len(), 2);
+    }
+
+    /// Verifies that `MAX_RECORDS_PER_ASSET` is the hard ceiling for per-asset
+    /// maintenance history, preventing the unbounded-Vec DoS described in issue #567.
+    #[test]
+    fn test_record_limit_enforcement() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // Initialize with max_history == MAX_RECORDS_PER_ASSET so the constant is
+        // the binding limit.
+        let cap = MAX_RECORDS_PER_ASSET;
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, cap);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        for _ in 0..cap {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "ok"),
+                &engineer,
+            );
+        }
+
+        // The (cap + 1)-th submission must be rejected with HistoryCapReached.
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "exceeds MAX_RECORDS_PER_ASSET"),
+            &engineer,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::HistoryCapReached as u32,
+            ))),
+        );
     }
 
     #[test]
